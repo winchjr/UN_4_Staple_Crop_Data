@@ -1,0 +1,858 @@
+---
+title: "UN Crop Data"
+author: "Joshua Winchester"
+date: "2022-10-24"
+output: pdf_document
+---
+```{r setup,echo=FALSE,include=FALSE}
+library(dplyr)
+library(FNN)
+library(caret)
+
+
+#import data
+potatodata <- read.csv("potatoesun.csv")
+ricedata <- read.csv("riceun.csv")
+maizedata <- read.csv("maizeun.csv")
+wheatdata <- read.csv("wheatun.csv")
+
+#add a column which identifies the crop type, so we can merge all the data
+potatodata <- potatodata %>%
+  mutate(Crop.Type = 'Potato')
+
+ricedata <- ricedata %>%
+  mutate(Crop.Type = 'Rice')
+
+maizedata <- maizedata %>%
+  mutate(Crop.Type = 'Maize')
+
+wheatdata <- wheatdata %>%
+  mutate(Crop.Type = 'Wheat')
+
+#merge all the data into one df
+allcropdata <- rbind(potatodata,ricedata,maizedata,wheatdata)
+
+###cleaning###
+
+#removing Elements we will not be using from data
+allcropdata <- allcropdata %>%
+filter(!grepl('Gross Production', Element), !grepl('Gross per', Element), !grepl('Unofficial', Element), !grepl('Footnote', Element), !grepl('Aggregate', Element), !grepl('FAO', Element), !grepl('Calculate', Element))
+
+#remove crop data which isnt in the target years
+allcropdata <- allcropdata %>%
+  filter((Year %in% 1970:2020))
+
+#region list used for subsetting below
+regionlist <- c("Africa", "Americas", "Asia","Eastern Asia","Least Developed Countries","Northern America","South-eastern Asia","Western Africa","World","Southern Europe","South America","Oceania","Northern Africa","Net Food Importing Developing Countries","Middle Africa","European Union (27)","Eastern Africa","Other non-specified areas","Africa","Central America","Eastern Europe","Land Locked Developing Countries","Low Income Food Deficit Countries","Northern Europe","Small Island Developing States","Southern Africa","Western Asia","Western Europe","Southern Asia","Central Asia")
+
+#subset the regional crop data from the national crop data
+regionalcropdata<-subset(allcropdata,Country.or.Area %in% regionlist)
+
+#subset our national crop data from the regional crop data
+cropdata<-subset(allcropdata,!(Country.or.Area %in% regionlist))
+
+#for some reason, there are two chinas listed: china and mainland china. Mainland china seems to be rounded down slightly (on the order of 1% or so), but it contains more observations. I am going to make the admin decision to include mainland china, and not the china data, and thats what this code does
+cropdata<-subset(cropdata,!Country.or.Area %in% c("China"))
+
+dropcols <- c("Value.Footnotes","Unit")
+cropdata <- cropdata[ , !(names(cropdata) %in% dropcols)]
+
+#renaming columns for ease of use
+colnames(cropdata)[colnames(cropdata) == 'Country.or.Area'] <- 'Country'
+#colnames(cropdata)[colnames(cropdata) == 'Value.Footnotes'] <- 'Valfn'
+colnames(cropdata)[colnames(cropdata) == 'Crop.Type'] <- 'Crop'
+
+attach(cropdata)
+
+orgcropdata <- data.frame(matrix(ncol=6,nrow=0, dimnames=list(NULL, c("Crop", "Year", "Country", "Production", "Yield", "Area Harvested"))))
+
+for (crop in unique(cropdata$Crop)){
+  for (year in unique(cropdata$Year)){
+    cat("\n I am now on year:", year)
+    for (country in unique(cropdata$Country)){
+      
+      this <- subset(cropdata,Country %in% country & Year %in% year & Crop %in% crop)
+      
+      if (nrow(this)!=0){
+      thisah <- subset(this,Element %in% "Area harvested")
+      thispro <- subset(this, Element %in% "Production")
+      thisyi <- subset(this, Element %in% "Yield")
+      
+      if (nrow(thisyi) == 0){
+        thisyi_val <- 0
+      }
+
+      else {
+        thisyi_val <- thisyi$Value
+      }
+      if (nrow(thisah) == 0){
+        thisah_val <- 0
+      }
+      else {
+        thisah_val <- thisah$Value
+      }
+      if (nrow(thispro) == 0){
+        thispro_val <- 0
+      }
+      else {
+        thispro_val <- thispro$Value
+      }
+      #cat("\n",crop, year, country, thispro$Value, thisyi$Value, thisah$Value)
+      orgcropdata[nrow(orgcropdata) + 1,] <- c(crop, year, country, thispro_val, thisyi_val, thisah_val)
+      }
+      
+      
+      
+    }
+  }
+}
+
+orgcropdata[,2] <- sapply(orgcropdata[,2], as.numeric)
+orgcropdata[,4] <- sapply(orgcropdata[,4], as.numeric)
+orgcropdata[,5] <- sapply(orgcropdata[,5], as.numeric)
+orgcropdata[,6] <- sapply(orgcropdata[,6], as.numeric)
+
+#separate the 2020 actual data from the main dataset
+orgcropdata2020 <- subset(orgcropdata,orgcropdata$Year==2020)
+
+#separate the 2019 actual data from the main dataset
+orgcropdata2019 <- subset(orgcropdata,orgcropdata$Year==2019)
+
+#remove 2019 + 2020 actual data from the main dataset
+orgcropdata<-subset(orgcropdata,!Year %in% c(2019,2020))
+
+#setting up k-fold training
+tr_ctrl <- trainControl(method = "cv",number = 10)
+```
+
+# Our Purpose
+
+Our goal is to examine all available UN crop data between 1970 and 2020 for the four major crops: Potatoes, Rice, Wheat, and Maize. We are going to attempt to answer three questions: 1) What can we infer about the nature of the production of these 4 crops in the past 50 years, 2) did COVID-19 impact agricultural output in any way?, and 3) how well can we predict the yield, production and area harvested for each year?
+
+The source for this data can be found here: http://data.un.org/Explorer.aspx 
+
+## The Data
+
+```{r}
+str(orgcropdata)
+```
+This data includes UN FAO (Food and Agricultural Organization) data from available nations between 1970 and 2020. Not all countries are represented (for various reasons: they don't submit to the UN, political situations, etc), and there are also additional difficulties because some countries change names, become parts of others, etc, such as Sudan. Nonetheless, most nations have had the same borders in the past 50 years, and also we will not be examining this on a national level. However, the vast majority of nations are represented, and especially all the largest ones agriculturally speaking.
+
+After cleaning, munging, and some simple subsetting, we also had to reorganize the data because it was not in a friendly format. After this, we are left with 6 variables: Crop, Year, Country, Production, Yield, and Area Harvested. Here is a brief explanation of each of them:
+
+**Crop**: Which of the 4 crops is this? Potatoes, Maize, Rice, or Wheat?
+
+**Year**: Which year is it, between 1970-2020?
+
+**Country**: Which country is this data from?
+
+**Production**: Total crop production, in tonnes, for that given year.
+
+**Yield**: Production per Area Harvested, in hg/ha, for that given year.
+
+**Area Harvested**: Total area harvested from, in ha, for that given year.
+
+It's important to note that not each year/nation/crop combination will have non na or 0 values, but the vast majority are positive non zero values.
+
+
+## Our Process
+
+In order to accomplish this goal, we are going to use K-nearest neighbors to create predicted values for each given year. We will remove the 2019 and 2020 data to use for comparison. We will create 12 separate plots, 1 for each crop and output statistic. We will compare each plot briefly, with some commentary of what the plots mean.
+
+## Reading the plots
+
+**Green Triangles** : Represents an individual data point from a nation and year
+
+**Red X** : Represents a knn predicted value for that year
+
+**Black Bar** : Represents the mean knn predicted value between 1970-2018
+
+**Black Dots**: Represents 2019 and 2020 mean data
+
+It's important to know too that Production and Area Harvested statistics have outliers removed, mostly because the outliers made the graphs hard to read. 
+
+\newpage
+
+# Testing Different Values of K
+
+What follows is the output of multiple different values of k. The value tested is labelled at the top; you can quickly scroll through them to see what the output looks like. We are going to test this on Potato Production only, and see if we can find an approximately good k value.
+```{r, echo=FALSE}
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Potato"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Potato"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Potato"))
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    for (k in c(1, 10, 50, 100, 200, 300, 400, 500, 750, 1000, 1250, 1500, 1750, 2000)){
+      
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[4], k = k)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    
+    knn_plot_df <- na.omit(knn_plot_df)
+    
+    
+    #plot 2: potatoes + production (removed high values)
+    plottingcrop <- subset(thiscropdata, Production < 10000000)
+    plot(plottingcrop$Year, plottingcrop$Production, xlab="Year", ylab="Production",main=paste("Potatoes Production per Country, in tonnes, at value k=",k),
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Production),pch=19)
+    points(2020,mean(this2020cropdata$Production),pch=19)
+    
+    }
+
+```
+
+## Summary
+What we saw was that, when our k=1, the results were chaotic and don't tell us much about the data. This is because our error is high, as a result of bias variance tradeoff: in this case, our variance is way too high and complex, as it is matching the data perfectly. If we scale up a bit, we find that about 300-500 there is an approximate sweet spot, and this makes sense: on average each of the crop/production statistic is between 6-8k total variables, and just as a quick approximation, if we divide that by 50 we get about 120-160, which is about how many data points we can expect for each year. A k value of 300-500 gives us about 2-4 years worth of data averaged around each point, roughly. This means that bad and good years (production wise) would be offset by previous stability slightly. As k approaches 2000, we see clear bias trending towards the mean. It seems that 300-500 gives us the most flexibility without being too chaotic in its results. From preliminary testing, I've found that the default guess of sqrt(nrows(dataset)) is good for yield here, but not good for production or area harvested. Going forward, we will use 400 for the production and area harvested, and sqrt(nrows(data)) for the yield.
+
+\newpage
+
+# The Plots
+
+## Potatoes
+
+### Production
+
+```{r potato production, echo=FALSE}
+##POTATOES##
+
+    # PRODUCTION #
+
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Potato"))
+  
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Potato"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Potato"))
+
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Production, data = thiscropdata, 
+                   method = "lm",
+                   trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+
+
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[4], k = 400)
+
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+
+    knn_plot_df <- na.omit(knn_plot_df)
+
+#plot: potatoes + production (removed high values)
+    plottingcrop <- subset(thiscropdata, Production < 10000000)
+    plot(plottingcrop$Year, plottingcrop$Production, xlab="Year", ylab="Production",main="Potatoes Production per Country, in tonnes",
+        pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Production),pch=19)
+    points(2020,mean(this2020cropdata$Production),pch=19)
+
+```
+Keep note of the ~14 RMSE. We will see if others are similar. We see potatoes have leveled off in production, with a seeming peak in the mid 70's. 2019/2020 data is below the overall predicted mean, but thats not unexpected, as potato production seems to be going down slightly or staying flat as time goes on.
+
+\newpage
+
+### Yield
+
+```{r potato yield, echo=FALSE}
+#subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Potato"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Potato"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Potato"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Yield, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[5], k = round(sqrt(nrows)))
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+#plot 3, potatoes + yield
+    knn_plot_df <- na.omit(knn_plot_df)
+    plot(thiscropdata$Year, thiscropdata$Yield, xlab="Year", ylab="Yield",main="Potatoes Yield per Country, in hg/ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Yield),pch=19)
+    points(2020,mean(this2020cropdata$Yield),pch=19)
+
+```
+We see a steady rise in the predicted values of yield with respect to the mean, suggesting that as time goes on, its expected to see higher yields. We also see that 2019/2020 are right where would expect them to be. In general, we should expect yields to rise for potatoes.
+
+\newpage
+
+### Area Harvested
+
+```{r potato area harvested, echo=FALSE}
+    # AREA HARVESTED #
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Potato"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Potato"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Potato"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Area.Harvested, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[6], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+    
+#potates + area (high values removeD)    
+    plottingcrop <- subset(thiscropdata, Area.Harvested < 1000000)
+    plot(plottingcrop$Year, plottingcrop$Area.Harvested, xlab="Year", ylab="Area Harvested",main="Area Harvested for Potatoes per Country, in ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Area.Harvested),pch=19)
+    points(2020,mean(this2020cropdata$Area.Harvested),pch=19)
+
+```
+Area harvested is clearly going down for potatoes as time goes on. So yields are up, production is flat or slightly falling, but area harvested is going down, with 2019/2020 confirming this.
+
+\newpage
+
+## Maize
+
+### Production
+
+```{r maize production, echo=FALSE}
+
+    
+    # PRODUCTION #
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Maize"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Maize"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Maize"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Production, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[4], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+    
+#plot maize + production (removed high values)
+    plottingcrop <- subset(thiscropdata, Production < 10000000)
+    plot(plottingcrop$Year, plottingcrop$Production, xlab="Year", ylab="Production",main="Maize Production per Country, in tonnes",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Production),pch=19)
+    points(2020,mean(this2020cropdata$Production),pch=19)
+```
+The k predictions clearly show a seeming overall rise as time goes on. 2019/2020 especially are fairly high, showing that average maize production in general has continued to rise in the past 50 years.
+
+
+\newpage
+
+### Yield
+
+```{r maize yield, echo=FALSE}
+    # YIELD #
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Potato"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Potato"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Potato"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Yield, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[5], k = round(sqrt(nrows)))
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+#plot 7, maize + yield
+    plot(thiscropdata$Year, thiscropdata$Yield, xlab="Year", ylab="Yield",main="Maize Yield per Country, in hg/ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Yield),pch=19)
+    points(2020,mean(this2020cropdata$Yield),pch=19)
+
+```
+And maybe this is why production has gone up? Average yields have slowly risen, with 2019/2020 confirming this trend.
+
+\newpage
+
+### Area Harvested
+
+```{r maize area harvested, echo=FALSE}
+    # AREA HARVESTED #
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Potato"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Potato"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Potato"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Area.Harvested, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[6], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+  
+    
+    
+#plot maize+ area harvested (removed high values)
+    plottingcrop <- subset(thiscropdata, Area.Harvested < 1000000)
+    plot(plottingcrop$Year, plottingcrop$Area.Harvested, xlab="Year", ylab="Area Harvested",main="Area Harvested for Maize per Country, in ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Area.Harvested),pch=19)
+    points(2020,mean(this2020cropdata$Area.Harvested),pch=19)
+
+
+```
+Area harvested is predicted to go down for maize, and 2019/2020 seem to be reaching towards the lowest means. But as we saw, production and yields have gone up for maize, suggesting much greater efficiency in farming maize in the past 50 years.
+
+\newpage
+
+## Wheat
+
+### Production
+
+```{r wheat production, echo=FALSE}
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Wheat"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Wheat"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Wheat"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Production, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[4], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+
+    
+#plot wheat + production (removed high values)
+    plottingcrop <- subset(thiscropdata, Production < 10000000)
+    
+    knn_plot_df <- na.omit(knn_plot_df)
+    plot(plottingcrop$Year, plottingcrop$Production, xlab="Year", ylab="Production",main="Wheat Production per Country, in tonnes",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Production),pch=19)
+    points(2020,mean(this2020cropdata$Production),pch=19)
+    
+
+```
+Production is seemingly unstable for wheat over time. Its possible our k value is distorting our view here a little. The 1980's peak is fascinating; maybe the break up of the Soviet Union caused troubles for wheat production in the early 90's? There was a resurgence in early 2010, and the 2019/2020 values seem to suggest wheat production is rising again.
+
+\newpage
+
+### Yield
+
+```{r wheat yield, echo=FALSE}
+
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Wheat"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Wheat"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Wheat"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Yield, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[5], k = round(sqrt(nrows)))
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+#plot 11, wheat + yield
+    plot(thiscropdata$Year, thiscropdata$Yield, xlab="Year", ylab="Yield",main="Wheat Yield per Country, in hg/ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Yield),pch=19)
+    points(2020,mean(this2020cropdata$Yield),pch=19)
+
+```
+Wheat yields show a similar story to maize: improved efficiency steadily throughout time, with a 2019/2020 peak.
+
+\newpage
+
+### Area Harvested
+
+```{r wheat area harvested, echo=FALSE}
+
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Wheat"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Wheat"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Wheat"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Area.Harvested, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[6], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+    
+#plot wheat + area harvested (removed high values)
+    plottingcrop <- subset(thiscropdata, Area.Harvested < 10000000)
+    plot(plottingcrop$Year, plottingcrop$Area.Harvested, xlab="Year", ylab="Area Harvested",main="Area Harvested for Wheat per Country, in ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Area.Harvested),pch=19)
+    points(2020,mean(this2020cropdata$Area.Harvested),pch=19)
+    
+```
+And again, similar to maize, harvested area for wheat is going down over time. Its clear that efficiency has improved for wheat too, regardless of overall production.
+
+\newpage
+
+## Rice
+
+### Production
+```{r rice production, echo=FALSE}
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Rice"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Rice"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Rice"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Production, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[4], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+
+
+    
+#plot: rice + production (removed high values)
+    plottingcrop <- subset(thiscropdata, Production < 10000000)
+    
+    knn_plot_df <- na.omit(knn_plot_df)
+    
+    plot(plottingcrop$Year, plottingcrop$Production, xlab="Year", ylab="Production",main="Rice Production per Country, in tonnes",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Production),pch=19)
+    points(2020,mean(this2020cropdata$Production),pch=19)
+
+```
+Much variability in the rice production predictions, but its clear that our knn is predicting rice is on a general upward trend too, with 2019/2020 maybe slightly lower than where they should be expected to be.
+
+\newpage
+
+### Yield
+```{r rice yield, echo=FALSE}
+
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Rice"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Rice"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Rice"))
+    
+    #k-fold cv
+    kfoldmodel <- train(Year ~ Yield, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[5], k = round(sqrt(nrows)))
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+#plot 15, rice + yield
+    plot(thiscropdata$Year, thiscropdata$Yield, xlab="Year", ylab="Yield",main="Rice Yield per Country, in hg/ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Yield),pch=19)
+    points(2020,mean(this2020cropdata$Yield),pch=19)
+    
+
+```
+A steady rise in efficiency, however the drop towards the end is concerning. This might be a fluke in the data, or possibly a sign of serious disruption in rice yields; its clear that 2019/2020 yields are lower than where we might expect them to be as well.
+
+\newpage
+
+### Area Harvested
+```{r rice area harvested, echo=FALSE}
+# AREA HARVESTED #
+    
+    #subset the data into specific df
+    thiscropdata <- subset(orgcropdata,Crop %in% c("Rice"))
+    
+    #separate the 2019 and 2020 data
+    this2019cropdata <- subset(orgcropdata2019,Crop %in% c("Rice"))
+    this2020cropdata <- subset(orgcropdata2020,Crop %in% c("Rice"))
+    
+    kfoldmodel <- train(Year ~ Area.Harvested, data = thiscropdata, method = "lm",trControl = tr_ctrl)
+    print("10 K-fold CV results:")
+    print(kfoldmodel$results)
+    
+    #create train test split, using 80/20
+    samp_split <- .8
+    nrows <- nrow(thiscropdata)
+    samp = sample(1:nrows,floor(samp_split*nrows))
+    tr = thiscropdata[samp,]
+    te = thiscropdata[-samp,]
+    
+    
+    #create KNN with years and valueType as specified
+    knn<- FNN::knn.reg(train = tr[2], test= te[2], y = tr[6], k = 400)
+    
+    #create knn df here, to make the plotting easier
+    knn_plot_df <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("Year", "Prediction"))))
+    yearseq <- seq(2018,1970,-1)
+    
+    for (i in 1:length(yearseq)){
+      knn_plot_df[nrow(knn_plot_df) + 1,] <- c(yearseq[i],unique(knn$pred)[i])
+    }
+    knn_plot_df <- na.omit(knn_plot_df)
+    
+#plot rice + area harvested (removed high values)
+    plottingcrop <- subset(thiscropdata, Area.Harvested < 10000000)
+    plot(plottingcrop$Year, plottingcrop$Area.Harvested, xlab="Year", ylab="Area Harvested",main="Area Harvested for Rice per Country, in ha",
+         pch=2,cex=.8,col="green",xlim=c(1970,2020)) 
+    points(knn_plot_df$Year,knn_plot_df$Prediction, pch=4, col="red",lwd=8)
+    abline(h=mean(knn_plot_df$Prediction))
+    points(2019,mean(this2019cropdata$Area.Harvested),pch=19)
+    points(2020,mean(this2020cropdata$Area.Harvested),pch=19)
+
+```
+Area harvested for rice seems to be relatively constant, although the scale of our plot might be obscuring the ups and downs a bit. 2019/2020 are right on the mean for predictions. Overall, rice seems to be increasing in production and yields in general over time.
+
+# Conclusion
+
+Overall, the impact of COVID on these 4 crops seem non existent.
+
+The rise in yields is clear in all the crops. The rise in all 4 crops for overall production seems to be rising too, except for potatoes, where our k value might be obscuring this information. At the same time, area harvested is predicted to have either gone down, or remained relatively flat, showcasing at the bare minimum an improvement in efficiency for all crops. All of the RMSE for our k-fold are around 14, which is a sign that its fairly consistent at predicting throughout all of our data.
